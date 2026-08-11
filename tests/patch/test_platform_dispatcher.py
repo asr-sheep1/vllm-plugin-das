@@ -66,6 +66,14 @@ def test_platform_core_inventory_is_explicit_and_ordered():
             "platform.core_fix.hcu_config.compilation_cudagraph",
             "vllm.config.compilation",
         ),
+        (
+            "platform.core_fix.spec_decode.dfly_config",
+            "vllm.config.speculative",
+        ),
+        (
+            "platform.core_fix.spec_decode.dcut_config",
+            "vllm.config.speculative",
+        ),
         ("platform.core_fix.hcu_config.vllm", "vllm.config.vllm"),
         (
             "platform.core_fix.hcu_config.slimquant_registry",
@@ -104,6 +112,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         (
             "platform.framework_opt.mtp_indexer_kv_cache_coordinator",
             "vllm.v1.core.kv_cache_coordinator",
+        ),
+        (
+            "platform.framework_opt.spec_decode.dcut_metrics",
+            "vllm.v1.spec_decode.metrics",
         ),
         (
             "platform.framework_opt.hcu_scheduler",
@@ -245,9 +257,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 37,
+        "count": 40,
         "replacements": 11,
-        "callbacks": 26,
+        "callbacks": 29,
         "failed": [],
         "builtins_same": True,
         "role": "Main",

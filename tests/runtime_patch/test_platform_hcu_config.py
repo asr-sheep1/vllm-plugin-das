@@ -589,6 +589,10 @@ def _make_vllm_module() -> ModuleType:
             self.compilation_config.post_init_cudagraph_sizes()
             return "upstream-result"
 
+        @property
+        def use_v2_model_runner(self) -> bool:
+            return True
+
     module.VllmConfig = FakeVllmConfig
     module.ModelConfig = _FakeModelConfig
     return module

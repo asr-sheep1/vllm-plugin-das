@@ -39,6 +39,11 @@ def register_model():
         "HYV3MTPModel", "vllm_hcu.models.hy_v3_mtp:HYV3MTP"
     )
 
+    ModelRegistry.register_model(
+        "Qwen3DFlyModel",
+        "vllm_hcu.models.qwen3_dfly:Qwen3DFlyForCausalLM",
+    )
+
 
 def register_quant_method():
     """to do"""

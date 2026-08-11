@@ -187,6 +187,8 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 )
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
+from vllm_hcu.v1.spec_decode.dspark import DSparkProposer
+from vllm_hcu.v1.spec_decode.dfly_gate import is_dfly_speculative_config
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -560,6 +562,7 @@ class GPUModelRunner(
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DFlashProposer
+                | DSparkProposer
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -596,6 +599,15 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dspark():
+                if not is_dfly_speculative_config(self.speculative_config):
+                    raise NotImplementedError(
+                        "The HCU V1 runner currently supports method='dspark' "
+                        "only for Qwen3DFlyModel. Native DSpark requires the "
+                        "vLLM V2 GPU runner."
+                    )
+                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
@@ -834,6 +846,7 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._dcut_keep_lens: torch.Tensor | None = None
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -868,6 +881,7 @@ class GPUModelRunner(
         self.draft_token_ids_copy_stream: torch.cuda.Stream | None = None
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
+        self.dcut_keep_lens_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
@@ -876,6 +890,12 @@ class GPUModelRunner(
             self.draft_token_ids_cpu = torch.empty(
                 (self.max_num_reqs, self.num_spec_tokens),
                 dtype=torch.int64,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            self.dcut_keep_lens_cpu = torch.empty(
+                self.max_num_reqs,
+                dtype=torch.int32,
                 device="cpu",
                 pin_memory=self.pin_memory,
             )
@@ -2444,7 +2464,8 @@ class GPUModelRunner(
 
             if self.speculative_config and spec_decode_common_attn_metadata is None and get_pp_group().is_last_rank:
                 if isinstance(
-                    self.drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)
+                    self.drafter,
+                    (EagleProposer, DFlashProposer, DSparkProposer, Gemma4Proposer),
                 ):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         if enable_lightly_cp:
@@ -4433,6 +4454,7 @@ class GPUModelRunner(
                 )
 
         self._draft_token_ids = None
+        self._dcut_keep_lens = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
@@ -4473,6 +4495,7 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DSparkProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -4672,6 +4695,13 @@ class GPUModelRunner(
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
+        if getattr(self, "_dcut_keep_lens", None) is not None:
+            assert self.dcut_keep_lens_cpu is not None
+            return DraftTokenIds(
+                req_ids,
+                draft_token_ids,
+                self.dcut_keep_lens_cpu[: len(req_ids)].tolist(),
+            )
         return DraftTokenIds(req_ids, draft_token_ids)
 
     def _copy_draft_token_ids_to_cpu(
@@ -4679,9 +4709,13 @@ class GPUModelRunner(
     ) -> None:
         # Check if we need to copy draft tokens to CPU. In async scheduling,
         # we only copy when needed for structured output, penalties or bad_words.
-        if self.use_async_scheduling and not (
-            scheduler_output.has_structured_output_requests
-            or self.input_batch.sampling_metadata.output_token_ids
+        if (
+            self.use_async_scheduling
+            and not (
+                scheduler_output.has_structured_output_requests
+                or self.input_batch.sampling_metadata.output_token_ids
+            )
+            and self._dcut_keep_lens is None
         ):
             return
         # We must also set the corresponding request ids.
@@ -4705,6 +4739,11 @@ class GPUModelRunner(
             else:
                 # No copy needed, just zero-out cpu tensor.
                 self.draft_token_ids_cpu[:num_reqs] = 0
+            if self._dcut_keep_lens is not None:
+                assert self.dcut_keep_lens_cpu is not None
+                self.dcut_keep_lens_cpu[:num_reqs].copy_(
+                    self._dcut_keep_lens[:num_reqs], non_blocking=True
+                )
             self.draft_token_ids_event.record()
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
@@ -4893,7 +4932,11 @@ class GPUModelRunner(
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+                EagleProposer
+                | DFlashProposer
+                | DSparkProposer
+                | DraftModelProposer
+                | Gemma4Proposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -5023,6 +5066,9 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
 
+        take_dcut_keep_lens = getattr(self.drafter, "take_dcut_keep_lens", None)
+        if callable(take_dcut_keep_lens):
+            self._dcut_keep_lens = take_dcut_keep_lens()
         return draft_token_ids
 
     def update_config(self, overrides: dict[str, Any]) -> None:
@@ -5229,8 +5275,29 @@ class GPUModelRunner(
         layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
         if not layer_ids:
             dflash_config = getattr(hf_config, "dflash_config", None)
-            if dflash_config and isinstance(dflash_config, dict):
-                layer_ids = dflash_config.get("target_layer_ids")
+            dflare_config = getattr(hf_config, "dflare_config", None)
+            inner = getattr(hf_config, "model", None)
+            if inner is not None:
+                if dflash_config is None:
+                    dflash_config = getattr(inner, "dflash_config", None)
+                if dflare_config is None:
+                    dflare_config = getattr(inner, "dflare_config", None)
+
+            for drafter_config in (dflash_config, dflare_config):
+                if drafter_config and isinstance(drafter_config, dict):
+                    target_layer_ids = drafter_config.get("target_layer_ids") or []
+                    if target_layer_ids:
+                        # DFlash-family ids identify decoder layers.  The target
+                        # model records the state after a layer at boundary i + 1.
+                        layer_ids = [i + 1 for i in target_layer_ids]
+                        break
+
+            if not layer_ids:
+                top_level_ids = getattr(hf_config, "target_layer_ids", None)
+                if not top_level_ids and inner is not None:
+                    top_level_ids = getattr(inner, "target_layer_ids", None)
+                if top_level_ids:
+                    layer_ids = [i + 1 for i in top_level_ids]
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
@@ -5442,7 +5509,10 @@ class GPUModelRunner(
 
     @contextmanager
     def maybe_randomize_inputs(
-        self, input_ids: torch.Tensor | None, inputs_embeds: torch.Tensor | None
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        force_randomize: bool = False,
     ):
         """
         Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
@@ -5452,7 +5522,11 @@ class GPUModelRunner(
         """
 
         dp_size = self.vllm_config.parallel_config.data_parallel_size
-        randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
+        randomize_inputs = (
+            force_randomize
+            or envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS
+            and dp_size > 1
+        )
         if not randomize_inputs:
             yield
         elif input_ids is not None:
@@ -5529,6 +5603,8 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        dcut_profile_num_reqs: int | None = None,
+        drafter_dummy_num_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5588,7 +5664,18 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
+        if dcut_profile_num_reqs is not None:
+            assert not uniform_decode and not create_mixed_batch
+            assert 0 < dcut_profile_num_reqs <= num_tokens
+            num_reqs = dcut_profile_num_reqs
+            tokens_per_req, extra_tokens = divmod(num_tokens, num_reqs)
+            assert tokens_per_req > 0
+            num_scheduled_tokens_list = [
+                tokens_per_req + (1 if index < extra_tokens else 0)
+                for index in range(num_reqs)
+            ]
+            max_query_len = max(num_scheduled_tokens_list)
+        elif create_mixed_batch:
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
@@ -5731,6 +5818,13 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
+                if dcut_profile_num_reqs is not None:
+                    draft_lens = num_scheduled_tokens - 1
+                    self.num_decode_draft_tokens.np[:num_reqs] = draft_lens
+                    self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+                    self.num_decode_draft_tokens.copy_to_gpu()
+                    self.num_accepted_tokens.np[:num_reqs_padded].fill(1)
+                    self.num_accepted_tokens.copy_to_gpu(num_reqs_padded)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -5789,7 +5883,11 @@ class GPUModelRunner(
                     num_tokens_across_dp[:] = num_tokens_padded
 
             with (
-                self.maybe_randomize_inputs(input_ids, inputs_embeds),
+                self.maybe_randomize_inputs(
+                    input_ids,
+                    inputs_embeds,
+                    force_randomize=dcut_profile_num_reqs is not None,
+                ),
                 set_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -5823,6 +5921,7 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DSparkProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -5852,11 +5951,18 @@ class GPUModelRunner(
                 ):
                     use_cudagraphs = False
 
+                drafter_extra: dict[str, Any] = {}
+                if drafter_dummy_num_tokens is not None and isinstance(
+                    self.drafter, DSparkProposer
+                ):
+                    drafter_extra["num_query_tokens"] = drafter_dummy_num_tokens
+                    drafter_extra["profile_num_reqs"] = dcut_profile_num_reqs
                 self.drafter.dummy_run(
                     num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
+                    **drafter_extra,
                 )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
@@ -6343,6 +6449,7 @@ class GPUModelRunner(
             )
             if self.model_config.enable_return_routed_experts:
                 self.init_routed_experts_capturer()
+            self._profile_dfly_dcut_cost_table()
             return 0
 
         # Initialize encoder CUDA graph manager if enabled.
@@ -6422,6 +6529,7 @@ class GPUModelRunner(
 
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.
+        self._profile_dfly_dcut_cost_table()
         lock_workspace()
 
         end_time = time.perf_counter()
@@ -6434,6 +6542,19 @@ class GPUModelRunner(
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def _profile_dfly_dcut_cost_table(self) -> None:
+        speculative_config = self.speculative_config
+        if speculative_config is None:
+            return
+        drafter = getattr(self, "drafter", None)
+        if (
+            not isinstance(drafter, DSparkProposer)
+            or getattr(speculative_config, "dflash_dcut", 0.0) != "auto"
+            or not get_pp_group().is_last_rank
+        ):
+            return
+        drafter.profile_dcut_cost_table()
 
     def _warmup_and_capture(
         self,
@@ -6638,7 +6759,11 @@ class GPUModelRunner(
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+                EagleProposer
+                | DFlashProposer
+                | DSparkProposer
+                | DraftModelProposer
+                | Gemma4Proposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -6694,6 +6819,7 @@ class GPUModelRunner(
                 self.drafter,
                 EagleProposer
                 | DFlashProposer
+                | DSparkProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer,
             )

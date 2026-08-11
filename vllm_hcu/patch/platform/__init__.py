@@ -15,6 +15,7 @@ from vllm_hcu.patch.tokenizer_callbacks import register_tokenizer_callbacks
 
 from .core_fix import register_platform_core_callbacks
 from .framework_opt import (
+    patch_dcut_metrics,
     patch_engine_core,
     patch_distributed_utils,
     patch_kv_cache_coordinator,
@@ -43,6 +44,7 @@ _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_kv_connector_factory,
     patch_parallel_state,
     patch_kv_cache_coordinator,
+    patch_dcut_metrics,
     patch_scheduler,
     patch_engine_core,
     patch_output_processor,

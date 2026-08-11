@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 from types import ModuleType
 
 from vllm_hcu.patch.config import get_hcu_config
@@ -25,6 +26,7 @@ TARGETS = (
     f"{TARGET_MODULE}.Scheduler.update_draft_token_ids",
     f"{TARGET_MODULE}.Scheduler.schedule",
     f"{TARGET_MODULE}.Scheduler.update_draft_token_ids_in_output",
+    f"{TARGET_MODULE}.Scheduler.make_stats",
     f"{TARGET_MODULE}.Scheduler._select_waiting_queue_for_scheduling",
     f"{TARGET_MODULE}.Scheduler._is_blocked_waiting_status",
     f"{TARGET_MODULE}.Scheduler._try_promote_blocked_waiting_request",
@@ -82,6 +84,101 @@ def apply_to_module(module: ModuleType) -> bool:
         f"{TARGETS[0]}.update_draft_token_ids_in_output",
         ("self", "draft_token_ids", "scheduler_output"),
     )
+    original_update_draft_token_ids = require_callable(
+        scheduler, "update_draft_token_ids", TARGETS[2]
+    )
+    original_make_stats = require_callable(scheduler, "make_stats", TARGETS[5])
+
+    def hcu_dcut_truncate(self, spec_token_ids: list[int], keep_len: int):
+        keep_len = max(0, int(keep_len))
+        actual_keep_len = min(keep_len, len(spec_token_ids))
+        self._pending_dcut_kept_draft_tokens = getattr(
+            self, "_pending_dcut_kept_draft_tokens", 0
+        ) + actual_keep_len + 1
+        self._pending_dcut_total_draft_tokens = getattr(
+            self, "_pending_dcut_total_draft_tokens", 0
+        ) + len(spec_token_ids) + 1
+        return spec_token_ids[:actual_keep_len]
+
+    def hcu_make_or_update_dcut_stats(self, spec_decoding_stats):
+        total = getattr(self, "_pending_dcut_total_draft_tokens", 0)
+        if not getattr(self, "log_stats", False) or not total:
+            return spec_decoding_stats
+        if spec_decoding_stats is None:
+            return None
+        observe_dcut = getattr(spec_decoding_stats, "observe_dcut", None)
+        if not callable(observe_dcut):
+            raise PatchCompatibilityError(
+                "SpecDecodingStats.observe_dcut was not installed"
+            )
+        observe_dcut(
+            kept_draft_tokens=getattr(
+                self, "_pending_dcut_kept_draft_tokens", 0
+            ),
+            total_draft_tokens=total,
+        )
+        self._pending_dcut_kept_draft_tokens = 0
+        self._pending_dcut_total_draft_tokens = 0
+        return spec_decoding_stats
+
+    @functools.wraps(original_update_draft_token_ids)
+    def hcu_update_draft_token_ids(self, draft_token_ids):
+        result = original_update_draft_token_ids(self, draft_token_ids)
+        keep_lens = getattr(draft_token_ids, "dcut_keep_lens", None)
+        if keep_lens is None:
+            return result
+        if len(keep_lens) != len(draft_token_ids.req_ids):
+            raise ValueError(
+                "D-Cut keep-length count does not match request count: "
+                f"{len(keep_lens)} != {len(draft_token_ids.req_ids)}"
+            )
+        for req_id, keep_len in zip(draft_token_ids.req_ids, keep_lens):
+            request = self.requests.get(req_id)
+            if (
+                request is None
+                or request.is_finished()
+                or request.is_prefill_chunk
+            ):
+                continue
+            request.spec_token_ids = self._dcut_truncate(
+                request.spec_token_ids,
+                keep_len,
+            )
+        return result
+
+    @functools.wraps(original_make_stats)
+    def hcu_make_stats(
+        self,
+        spec_decoding_stats=None,
+        kv_connector_stats=None,
+        cudagraph_stats=None,
+        perf_stats=None,
+    ):
+        spec_decoding_stats = self._make_or_update_dcut_stats(
+            spec_decoding_stats
+        )
+        return original_make_stats(
+            self,
+            spec_decoding_stats,
+            kv_connector_stats,
+            cudagraph_stats,
+            perf_stats,
+        )
+
+    setattr(
+        scheduler,
+        "_vllm_hcu_original_dcut_update_draft_token_ids",
+        original_update_draft_token_ids,
+    )
+    setattr(scheduler, "update_draft_token_ids", hcu_update_draft_token_ids)
+    setattr(scheduler, "_dcut_truncate", hcu_dcut_truncate)
+    setattr(
+        scheduler,
+        "_make_or_update_dcut_stats",
+        hcu_make_or_update_dcut_stats,
+    )
+    setattr(scheduler, "_vllm_hcu_original_dcut_make_stats", original_make_stats)
+    setattr(scheduler, "make_stats", hcu_make_stats)
     setattr(target, _MARKER, True)
     return True
 

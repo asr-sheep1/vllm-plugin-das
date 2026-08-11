@@ -18,6 +18,8 @@ from vllm_hcu.patch.import_coordinator import (
 
 from . import (
     patch_compilation_config,
+    patch_dcut_speculative_config,
+    patch_dfly_speculative_config,
     patch_engine_args,
     patch_envs,
     patch_hy_v3_reasoning_parser,
@@ -36,6 +38,8 @@ _ORDERED_ADAPTERS = (
     patch_import_utils,
     patch_engine_args,
     patch_compilation_config,
+    patch_dfly_speculative_config,
+    patch_dcut_speculative_config,
     patch_vllm_config,
     patch_slimquant_registry,
     patch_hy_v3_reasoning_parser,

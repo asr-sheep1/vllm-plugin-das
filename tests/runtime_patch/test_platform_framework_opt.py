@@ -155,6 +155,15 @@ def _fake_scheduler_module():
         def update_draft_token_ids_in_output(self, draft_token_ids, scheduler_output):
             return None
 
+        def make_stats(
+            self,
+            spec_decoding_stats=None,
+            kv_connector_stats=None,
+            cudagraph_stats=None,
+            perf_stats=None,
+        ):
+            return spec_decoding_stats
+
     for name in (
         "_select_waiting_queue_for_scheduling",
         "_is_blocked_waiting_status",
