@@ -164,10 +164,16 @@ def test_feature_off_mlp_down_projection_uses_float_activation(
     "relative_path",
     ("vllm_hcu/models/hy_v3.py", "vllm_hcu/models/glm4_moe.py"),
 )
-def test_moe_models_reject_triton_cache_layout_for_fused_qkv_store(relative_path):
+def test_moe_models_gate_fused_qkv_store_to_block_first_cache(relative_path):
     supports = _load_top_level_function(
         relative_path, "fused_qkv_cache_layout_supported"
     )
 
-    assert not supports(SimpleNamespace(get_name=lambda: "TRITON_ATTN"))
-    assert supports(SimpleNamespace(get_name=lambda: "FLASH_ATTN"))
+    flash_attn = SimpleNamespace(get_name=lambda: "FLASH_ATTN")
+    triton_attn = SimpleNamespace(get_name=lambda: "TRITON_ATTN")
+
+    assert supports(flash_attn, "cutlass", "auto")
+    assert supports(flash_attn, "cutlass", "fp8_e4m3")
+    assert not supports(flash_attn, "custom", "auto")
+    assert not supports(flash_attn, "cutlass", "fp8_e5m2")
+    assert not supports(triton_attn, "cutlass", "auto")

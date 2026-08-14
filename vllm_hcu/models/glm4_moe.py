@@ -100,8 +100,16 @@ from vllm_hcu.ops.fuse_rms_norm_quant import FusedRMSNormAndQuant
 logger = init_logger(__name__)
 
 
-def fused_qkv_cache_layout_supported(attn_backend: type) -> bool:
-    return attn_backend.get_name() != "TRITON_ATTN"
+def fused_qkv_cache_layout_supported(
+    attn_backend: type,
+    flash_attn_mode: str,
+    kv_cache_dtype: str,
+) -> bool:
+    return (
+        attn_backend.get_name() == "FLASH_ATTN"
+        and flash_attn_mode != "custom"
+        and kv_cache_dtype in ("auto", "bfloat16", "fp8", "fp8_e4m3")
+    )
 
 
 class Glm4MoeMLP(nn.Module):
@@ -372,7 +380,13 @@ class Glm4MoeAttention(nn.Module):
                 torch.get_default_dtype(),
                 kv_cache_dtype,
             )
-            if not fused_qkv_cache_layout_supported(attn_backend):
+            from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
+
+            if not fused_qkv_cache_layout_supported(
+                attn_backend,
+                get_hcu_flash_attn_mode(),
+                kv_cache_dtype,
+            ):
                 self.enable_fused_qkv_split_rms_rope_kvstore = False
         weight = getattr(self.qkv_proj, "weight", None)
         self.quant_dtype = weight.dtype if weight is not None else None

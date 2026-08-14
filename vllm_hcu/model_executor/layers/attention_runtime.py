@@ -171,15 +171,12 @@ def fused_qkv_split_rmsnorm_rope_kv_store_impl(
     attn_layer = forward_context.no_compile_layers[layer_name]
     kv_cache = attn_layer.kv_cache
 
-    from vllm_hcu.platforms.hcu import get_hcu_flash_attn_mode
-
-    flash_attn_mode = get_hcu_flash_attn_mode()
-    kv_axis = 0 if flash_attn_mode == "custom" else 1
-    fused_cache_store = (
-        layer_slot_mapping is not None and flash_attn_mode == "custom"
-    )
-    if fused_cache_store:
-        key_cache, value_cache = split_kv_cache(kv_cache, kv_axis=kv_axis)
+    key_cache = value_cache = None
+    k_scale = v_scale = None
+    if layer_slot_mapping is not None:
+        # CUTLASS stores K/V as a block-first interleaved cache.  Unbinding
+        # axis 1 preserves its physical NHD/HND strides for LightOp.
+        key_cache, value_cache = split_kv_cache(kv_cache, kv_axis=1)
         if kv_cache_dtype.startswith("fp8"):
             from vllm_hcu.v1.attention.backends.flash_attn import (
                 HcuFlashAttentionBackend,
@@ -190,76 +187,43 @@ def fused_qkv_split_rmsnorm_rope_kv_store_impl(
             )
             key_cache = key_cache.view(fp8_dtype)
             value_cache = value_cache.view(fp8_dtype)
-    else:
-        # LightOp's fused writer follows CUSTOM's split K/V physical ABI.
-        # Non-custom caches use the target block-first ABI, so retain the
-        # fused QKV/RMS/RoPE compute and perform the cache write separately
-        # through AITER's stride-aware writer below.
-        key_cache = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
-        value_cache = torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+        k_scale = attn_layer._k_scale
+        v_scale = attn_layer._v_scale
 
     try:
-        from lightop import split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant
+        from lightop.attention import (
+            split_qkv_rms_rotary_embedding_fuse_with_kv_store_block_first,
+        )
     except ImportError as exc:
         raise RuntimeError(
-            "VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE requires lightop"
+            "VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE requires a "
+            "LightOp build with block-first KV-store support"
         ) from exc
 
-    q, k, v = split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant(
+    q, k, v = split_qkv_rms_rotary_embedding_fuse_with_kv_store_block_first(
         positions,
         qkv.contiguous(),
         q_size,
         kv_size,
         cos_sin_cache,
         head_dim=head_size,
-        page_size=block_size,
-        k_buffer=key_cache,
-        v_buffer=value_cache,
-        kv_cache_loc=layer_slot_mapping if fused_cache_store else None,
+        block_size=block_size,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_mapping=layer_slot_mapping,
         is_neox=is_neox,
         weight_q=weight_q_norm,
         weight_k=weight_k_norm,
         output_dtype=qkv.dtype,
-        kv_cache_dtype=kv_cache_dtype,
-        epsilon=epsilon,
         residual_q=None,
         residual_k=None,
-        k_scale=None,
-        v_scale=None,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        epsilon=epsilon,
     )
     q = q.contiguous().view(num_tokens, q_size // head_size, head_size)
     k = k.contiguous().view(num_tokens, kv_size // head_size_v, head_size_v)
     v = v.contiguous().view(num_tokens, kv_size // head_size_v, head_size_v)
-
-    if layer_slot_mapping is not None and not fused_cache_store:
-        from vllm_hcu.v1.attention.backends.fa_utils import (
-            reshape_and_cache_flash,
-        )
-
-        target_key_cache, target_value_cache = split_kv_cache(
-            kv_cache,
-            kv_axis=kv_axis,
-        )
-        if kv_cache_dtype.startswith("fp8"):
-            from vllm_hcu.v1.attention.backends.flash_attn import (
-                HcuFlashAttentionBackend,
-            )
-
-            fp8_dtype = HcuFlashAttentionBackend.get_fp8_dtype_for_flashattn(
-                kv_cache_dtype
-            )
-            target_key_cache = target_key_cache.view(fp8_dtype)
-            target_value_cache = target_value_cache.view(fp8_dtype)
-        reshape_and_cache_flash(
-            k,
-            v,
-            target_key_cache,
-            target_value_cache,
-            layer_slot_mapping,
-            kv_cache_dtype,
-            attn_layer._k_scale,
-            attn_layer._v_scale,
-        )
     return q, k, v
 
 

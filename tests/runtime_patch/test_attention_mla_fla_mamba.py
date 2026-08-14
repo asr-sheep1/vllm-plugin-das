@@ -411,75 +411,98 @@ def test_fused_attention_rejects_incompatible_stacked_kv_axis(
         runtime.split_kv_cache(torch.empty(cache_shape), kv_axis=kv_axis)
 
 
-def test_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "storage_dtype", "expected_cache_dtype"),
+    [
+        ("auto", torch.bfloat16, torch.bfloat16),
+        ("fp8_e4m3", torch.uint8, torch.float8_e4m3fn),
+    ],
+)
+def test_fused_kv_store_passes_block_first_cache_directly_to_lightop(
     monkeypatch: pytest.MonkeyPatch,
+    kv_cache_dtype: str,
+    storage_dtype: torch.dtype,
+    expected_cache_dtype: torch.dtype,
 ):
     try:
         runtime = importlib.import_module(
             "vllm_hcu.model_executor.layers.attention_runtime"
         )
         forward_context_module = importlib.import_module("vllm.forward_context")
-        hcu_platform = importlib.import_module("vllm_hcu.platforms.hcu")
     except (ImportError, RuntimeError):
         pytest.skip("vLLM custom-op registry is unavailable in this environment")
 
     num_tokens, num_blocks, block_size = 2, 3, 4
     q_size, kv_size, head_size = 4, 2, 2
-    kv_cache = torch.empty(num_blocks, 2, block_size, 1, head_size)
+    kv_cache = torch.empty(
+        num_blocks,
+        2,
+        block_size,
+        1,
+        head_size,
+        dtype=storage_dtype,
+    )
     slot_mapping = torch.tensor([0, 5])
+    k_scale = torch.tensor(0.5)
+    v_scale = torch.tensor(0.25)
     layer = SimpleNamespace(
         kv_cache=kv_cache,
-        _k_scale=torch.tensor(1.0),
-        _v_scale=torch.tensor(1.0),
+        _k_scale=k_scale,
+        _v_scale=v_scale,
     )
     context = SimpleNamespace(
         slot_mapping={"layer": slot_mapping},
         no_compile_layers={"layer": layer},
     )
     monkeypatch.setattr(forward_context_module, "get_forward_context", lambda: context)
-    monkeypatch.setattr(hcu_platform, "get_hcu_flash_attn_mode", lambda: "cutlass")
+    if kv_cache_dtype.startswith("fp8"):
+        flash_attn_module = ModuleType(
+            "vllm_hcu.v1.attention.backends.flash_attn"
+        )
+        flash_attn_module.HcuFlashAttentionBackend = SimpleNamespace(
+            get_fp8_dtype_for_flashattn=lambda _: torch.float8_e4m3fn
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm_hcu.v1.attention.backends.flash_attn",
+            flash_attn_module,
+        )
 
-    lightop_calls: list[dict[str, object]] = []
+    lightop_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     lightop_module = ModuleType("lightop")
+    lightop_module.__path__ = []
+    lightop_attention_module = ModuleType("lightop.attention")
 
     def fake_lightop(*args, **kwargs):
-        del args
-        lightop_calls.append(kwargs)
-        assert kwargs["kv_cache_loc"] is None
-        assert kwargs["k_buffer"].numel() == 0
-        assert kwargs["v_buffer"].numel() == 0
+        lightop_calls.append((args, kwargs))
         return (
-            torch.arange(num_tokens * q_size, dtype=torch.float32).reshape(
+            torch.arange(num_tokens * q_size, dtype=torch.bfloat16).reshape(
                 num_tokens, q_size
             ),
-            torch.arange(num_tokens * kv_size, dtype=torch.float32).reshape(
+            torch.arange(num_tokens * kv_size, dtype=torch.bfloat16).reshape(
                 num_tokens, kv_size
             ),
-            torch.arange(num_tokens * kv_size, dtype=torch.float32)
+            torch.arange(num_tokens * kv_size, dtype=torch.bfloat16)
             .reshape(num_tokens, kv_size)
             .add(100),
         )
 
-    lightop_module.split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant = (
-        fake_lightop
+    block_first_op = (
+        "split_qkv_rms_rotary_embedding_fuse_with_kv_store_block_first"
     )
+    setattr(lightop_attention_module, block_first_op, fake_lightop)
+    lightop_module.attention = lightop_attention_module
     monkeypatch.setitem(sys.modules, "lightop", lightop_module)
-
-    writer_calls: list[tuple[object, ...]] = []
-    aiter_cache_module = ModuleType("aiter.ops.cache")
-    aiter_cache_module.reshape_and_cache_flash = (
-        lambda *args: writer_calls.append(args)
-    )
-    monkeypatch.setitem(sys.modules, "aiter.ops.cache", aiter_cache_module)
+    monkeypatch.setitem(sys.modules, "lightop.attention", lightop_attention_module)
 
     q, key, value = runtime.fused_qkv_split_rmsnorm_rope_kv_store_impl(
-        torch.zeros(num_tokens, q_size + 2 * kv_size),
+        torch.zeros(num_tokens, q_size + 2 * kv_size, dtype=torch.bfloat16),
         torch.arange(num_tokens),
         "layer",
-        "auto",
-        torch.empty(num_tokens, head_size),
-        torch.ones(head_size),
-        torch.ones(head_size),
+        kv_cache_dtype,
+        torch.empty(num_tokens, head_size, dtype=torch.bfloat16),
+        torch.ones(head_size, dtype=torch.bfloat16),
+        torch.ones(head_size, dtype=torch.bfloat16),
         1e-5,
         head_size,
         head_size,
@@ -489,16 +512,22 @@ def test_fused_kv_store_routes_block_first_cache_to_stride_aware_writer(
     )
 
     assert len(lightop_calls) == 1
-    assert len(writer_calls) == 1
-    writer_key, writer_value, key_cache, value_cache, writer_slots, *_ = (
-        writer_calls[0]
-    )
-    assert writer_key is key
-    assert writer_value is value
-    assert writer_slots is slot_mapping
+    _, lightop_kwargs = lightop_calls[0]
+    key_cache = lightop_kwargs["key_cache"]
+    value_cache = lightop_kwargs["value_cache"]
+    assert lightop_kwargs["slot_mapping"] is slot_mapping
+    assert lightop_kwargs["k_scale"] is k_scale
+    assert lightop_kwargs["v_scale"] is v_scale
+    assert key_cache.dtype == expected_cache_dtype
+    assert value_cache.dtype == expected_cache_dtype
     assert key_cache.stride(0) == 2 * block_size * head_size
     assert value_cache.stride(0) == 2 * block_size * head_size
     assert q.shape == (num_tokens, q_size // head_size, head_size)
+    assert key.shape == value.shape == (
+        num_tokens,
+        kv_size // head_size,
+        head_size,
+    )
 
 
 def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
